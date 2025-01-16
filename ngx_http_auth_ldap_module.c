@@ -125,6 +125,7 @@ typedef struct {
     uint32_t outcome;        /* OUTCOME_DENY or OUTCOME_ALLOW            */
     ngx_msec_t time;         /* ngx_current_msec when created            */
     u_char big_hash[16];     /* md5 hash of (username, server, password) */
+    ngx_array_t *member_of; 
 } ngx_http_auth_ldap_cache_elt_t;
 
 typedef struct {
@@ -160,6 +161,7 @@ typedef struct {
     ngx_str_t dn;
     ngx_str_t user_dn;
     ngx_str_t group_dn;
+    ngx_array_t *member_of;
 
     ngx_http_auth_ldap_cache_elt_t *cache_bucket;
     u_char cache_big_hash[16];
@@ -224,6 +226,10 @@ static ngx_int_t ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_a
 static ngx_int_t ngx_http_auth_ldap_recover_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx);
 #if (NGX_OPENSSL)
 static ngx_int_t ngx_http_auth_ldap_restore_handlers(ngx_connection_t *conn);
+
+static char * ngx_http_auth_ldap_info(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_auth_ldap_info_handler(ngx_http_request_t *r);
+
 #endif
 
 ngx_http_auth_ldap_cache_t ngx_http_auth_ldap_cache;
@@ -282,6 +288,14 @@ static ngx_command_t ngx_http_auth_ldap_commands[] = {
         NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_HTTP_LMT_CONF | NGX_CONF_ANY,
         ngx_http_auth_ldap_servers,
         NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL
+    },
+    {
+        ngx_string("auth_ldap_info"),
+        NGX_HTTP_LOC_CONF | NGX_CONF_NOARGS,
+        ngx_http_auth_ldap_info,
+        0,
         0,
         NULL
     },
@@ -946,6 +960,9 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
         if (elt->small_hash == ctx->cache_small_hash &&
                 elt->time > time_limit &&
                 memcmp(elt->big_hash, ctx->cache_big_hash, 16) == 0) {
+                    if (elt->member_of->nelts > 0){
+                        ctx->member_of = elt->member_of;
+                    }
             return elt->outcome;
         }
     }
@@ -972,8 +989,11 @@ ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
     oldest_elt->outcome = outcome;
     oldest_elt->small_hash = ctx->cache_small_hash;
     ngx_memcpy(oldest_elt->big_hash, ctx->cache_big_hash, 16);
-}
 
+    if (ctx->member_of->nelts > 0){
+        oldest_elt->member_of = ctx->member_of;
+    }
+}
 
 /*** OpenLDAP SockBuf implementation over nginx socket functions ***/
 
@@ -1612,7 +1632,19 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
                             ngx_memcpy(c->rctx->dn.data, dn, c->rctx->dn.len + 1);
                             ldap_memfree(dn);
                         }
+                        struct berval **groups = ldap_get_values_len(c->ld, result, "memberOf");
+                        if (groups) {
+                            ngx_array_t *member_of = ngx_array_create(c->rctx->r->pool, 10, sizeof(ngx_str_t));
+                            for (int i = 0; groups[i] != NULL; i++) {
+                                ngx_str_t *group = ngx_array_push(member_of);
+                                group->data = ngx_pnalloc(c->rctx->r->pool, groups[i]->bv_len);
+                                ngx_memcpy(group->data, groups[i]->bv_val, groups[i]->bv_len);
+                                group->len = groups[i]->bv_len;
+                            }
+                            c->rctx->member_of = member_of;
+                        }
                     }
+
                 } else if (ldap_msgtype(result) == LDAP_RES_SEARCH_RESULT) {
                     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: Received search result (%d: %s [%s])",
                         error_code, ldap_err2string(error_code), error_msg ? error_msg : "-");
@@ -1834,7 +1866,6 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
         /* Other fields have been initialized to zero/NULL */
         ngx_http_set_ctx(r, ctx, ngx_http_auth_ldap_module);
     }
-
     return ngx_http_auth_ldap_authenticate(r, ctx, alcf);
 }
 
@@ -2041,6 +2072,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 }
 
                 if (ctx->outcome == OUTCOME_ALLOW || ctx->outcome == OUTCOME_CACHED_ALLOW) {
+                    // check ok
                     return NGX_OK;
                 }
 
@@ -2080,7 +2112,7 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search filter is \"%s\"",
             (const char *) filter);
 
-        attrs[0] = LDAP_NO_ATTRS;
+        attrs[0] = LDAP_ALL_USER_ATTRIBUTES;
         attrs[1] = NULL;
 
         rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
@@ -2146,7 +2178,6 @@ ngx_http_auth_ldap_check_user(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
             }
         }
     }
-
     return NGX_OK;
 }
 
@@ -2356,4 +2387,86 @@ ngx_http_auth_ldap_recover_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: binddn bind successful");
     }
     return NGX_OK;
+}
+
+static char* 
+ngx_http_auth_ldap_info(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    ngx_http_core_loc_conf_t *clcf;
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_auth_ldap_info_handler;
+
+    return NGX_CONF_OK;
+}
+
+static ngx_str_t ngx_ldap_info_json(ngx_pool_t *pool, ngx_str_t user, ngx_array_t *groups) {
+    size_t i;
+    ngx_str_t *elements;
+    ngx_str_t json;
+    ngx_str_t separator = ngx_string(", ");
+    size_t json_len = sizeof("{\"user\": \"\", \"groups\": []}") - 1 + user.len;
+
+    elements = (ngx_str_t *) groups->elts;
+    for (i = 0; i < groups->nelts; i++) {
+        json_len += elements[i].len + 2;
+        if (i < groups->nelts - 1) {
+            json_len += separator.len;
+        }
+    }
+    json.data = ngx_palloc(pool, json_len);
+    json.len = json_len;
+
+    u_char *p = json.data;
+    p = ngx_sprintf(p, "{\"user\": \"%V\", \"groups\": [", &user);
+
+    for (i = 0; i < groups->nelts; i++) {
+        if (i > 0) {
+            p = ngx_copy(p, separator.data, separator.len);
+        }
+        *p++ = '"';
+        p = ngx_copy(p, elements[i].data, elements[i].len);
+        *p++ = '"';
+    }
+
+    *p++ = ']';
+    *p++ = '}';
+    *p = '\0';
+
+    return json;
+}
+
+static ngx_int_t 
+ngx_http_auth_ldap_info_handler(ngx_http_request_t *r) {
+    ngx_int_t rc = ngx_http_auth_ldap_handler(r);
+    if (rc == NGX_OK) {
+        ngx_http_auth_ldap_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_auth_ldap_module);
+        r->headers_out.content_type.len = sizeof("application/json") - 1;
+        r->headers_out.content_type.data = (u_char *)"application/json";
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "groups: %d", ctx->member_of->nelts);
+        ngx_str_t json = ngx_ldap_info_json(r->pool, r->headers_in.user, ctx->member_of);
+        if (json.data == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        r->headers_out.content_type.len = sizeof("application/json") - 1;
+        r->headers_out.content_type.data = (u_char *)"application/json";
+        r->headers_out.content_length_n = json.len;
+
+        ngx_http_send_header(r);
+
+        ngx_buf_t *b = ngx_create_temp_buf(r->pool, json.len);
+        if (b == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ngx_memcpy(b->pos, json.data, json.len);
+        b->last = b->pos + json.len;
+        b->last_buf = 1;
+
+        ngx_chain_t out;
+        out.buf = b;
+        out.next = NULL;
+        return ngx_http_output_filter(r, &out);
+    } else {
+        return rc;
+    }
 }
