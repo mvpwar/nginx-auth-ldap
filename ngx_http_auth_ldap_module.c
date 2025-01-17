@@ -2167,6 +2167,44 @@ ngx_http_auth_ldap_check_user(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
     return NGX_OK;
 }
 
+static char* process_string(const char *str) {
+    int new_length = 0;
+    const char *s = str;
+    while (*s) {
+        if (*s == '\\') {
+        } else if (*s == '(' || *s == ')') {
+            new_length += 2;
+        } else {
+            new_length++;
+        }
+        s++;
+    }
+
+    char *result = (char *)malloc(new_length + 1);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    const char *src = str;
+    char *dst = result;
+    while (*src) {
+        if (*src == '\\') {
+        } else if (*src == '(') {
+            *dst++ = '\\';
+            *dst++ = '(';
+        } else if (*src == ')') {
+            *dst++ = '\\';
+            *dst++ = ')';
+        } else {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0'; 
+
+    return result;
+}
+
 static ngx_int_t
 ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 {
@@ -2263,11 +2301,12 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: group_attribute.data is \"%V\" so calling a failure here", ctx->server->group_attribute.data);
         rc = !LDAP_SUCCESS;
     } else {
-        for_filter = ngx_strlen(cn_gr) + ctx->server->group_attribute.len + ngx_strlen((const char *) user_val) + ngx_strlen("(&()(=))") + 1;
+        char *modified_user_val = process_string(user_val);
+        for_filter = ngx_strlen(cn_gr) + ctx->server->group_attribute.len + ngx_strlen((const char *) modified_user_val) + ngx_strlen("(&()(=))") + 1;
         filter = ngx_pcalloc(
             r->pool,
             for_filter);
-        ngx_sprintf(filter, "(&(%s)(%s=%s))", cn_gr, ctx->server->group_attribute.data, user_val);
+        ngx_sprintf(filter, "(&(%s)(%s=%s))", cn_gr, ctx->server->group_attribute.data, modified_user_val);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search group filter is \"%s\"", (const char *) filter);
         attrs[0] = LDAP_NO_ATTRS;
         attrs[1] = NULL;
